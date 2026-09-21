@@ -64,7 +64,10 @@ export const usePlatformStore = defineStore('platform', {
     tasks: [],                  // 深拷贝（含完成状态）
     goods: [],                  // 商城商品（响应式库存 + 预占）
     records: [],                // 抽奖 / 兑换业务记录（含 frozen/released/revoked 状态）
-    pointRecords: [],           // 积分流水（append-only）
+    pointRecords: [],           // 积分流水（append-only；超留存上限的最老流水裁剪后转入 flowArchive 归档，不丢弃）
+    flowArchive: [],            // 流水裁剪归档台账（append-only，按业务日聚合）：被裁流水的净额/补偿净额/奖励净额/
+                                // 任务结算与补偿明细（按台账 id）在此留存——对账勾稽、领奖判重、余额链与统计的统一留存依据
+    flowAnchor: { balance: 0, ts: 0 }, // 余额链锚点：被裁流水按 ts 重放的期末余额，即现存流水链的重放起算余额
     taskClaims: [],             // 任务领奖台账（append-only）：{ taskId, bizDate 归属业务日, grantDate 实际发放日, reward }，防重复发奖的唯一判重依据
     riskOrders: [],             // 风控审核单
     auditLogs: [],              // 操作记录（审计日志）
@@ -167,7 +170,8 @@ export const usePlatformStore = defineStore('platform', {
         epicWins: draws.filter((r) => r.rarity === 'epic').length,
         pointsIssued: state.pointRecords
           .filter((p) => p.delta > 0 && p.kind !== 'refund')
-          .reduce((s, p) => s + p.delta, 0),
+          .reduce((s, p) => s + p.delta, 0) +
+          state.flowArchive.reduce((s, a) => s + a.rewardNet, 0), // 含已裁剪归档的奖励流水，统计不随裁剪缩水
         goodsSold: state.records.filter((r) => r.type === 'redeem' && r.status !== 'revoked').length,
         taskSettlements: state.taskClaims.length,
         pendingRisk: state.riskOrders.filter((o) => o.status === 'pending' || o.status === 'appealed').length,
@@ -179,7 +183,8 @@ export const usePlatformStore = defineStore('platform', {
         reconOpen: state.reconBills.filter((b) => ['pending', 'reviewed'].includes(b.status)).length,
         reconCompensated: state.pointRecords
           .filter((p) => p.kind === 'recon-comp' || p.kind === 'task-comp')
-          .reduce((s, p) => s + p.delta, 0),
+          .reduce((s, p) => s + p.delta, 0) +
+          state.flowArchive.reduce((s, a) => s + a.compNet, 0), // 含已裁剪归档的补偿流水
         stockAdjCount: state.stockAdjustments.length
       }
     },
@@ -189,12 +194,13 @@ export const usePlatformStore = defineStore('platform', {
     reconOpenCount(s) {
       return s.reconBills.filter((b) => ['pending', 'reviewed'].includes(b.status)).length
     },
-    // 可选对账业务日：有业务记录/审核单/任务台账/已有对账单的日期，倒序
+    // 可选对账业务日：有业务记录/审核单/任务台账/流水归档/已有对账单的日期，倒序
     reconDates(s) {
       const dates = new Set()
       s.records.forEach((r) => dates.add(r.date))
       s.riskOrders.forEach((o) => dates.add(o.createdAt))
       s.taskClaims.forEach((c) => { dates.add(c.bizDate); dates.add(c.grantDate) })
+      s.flowArchive.forEach((a) => dates.add(a.bizDate))
       s.reconBills.forEach((b) => dates.add(b.date))
       dates.add(s.todayDate)
       return [...dates].sort().reverse()
@@ -300,10 +306,47 @@ export const usePlatformStore = defineStore('platform', {
       if (this.pointRecords.length > 300) this.popIfTrimmed()
     },
     popIfTrimmed() {
-      // 补偿/对账流水优先保留，裁剪最老的普通流水（append-only 历史行不被改写，仅控制演示内存）
+      // 超留存上限时裁剪最老流水（补偿/对账流水优先保留；append-only 历史行不被改写，仅控制演示内存）。
+      // 裁剪不丢弃——转入归档台账按业务日聚合留存，并推进余额链锚点：
+      // 历史对账勾稽、领奖台账判重、余额链与奖励统计统一从「现存流水 + 归档」推导，
+      // 杜绝裁剪产生虚假差异、已发任务奖励被误判缺笔而重复补发。
       const oldest = [...this.pointRecords].reverse().find((p) => !['recon-comp', 'task-comp'].includes(p.kind))
-      if (oldest) this.pointRecords.splice(this.pointRecords.indexOf(oldest), 1)
-      else this.pointRecords.pop()
+      const removed = oldest || this.pointRecords[this.pointRecords.length - 1]
+      if (!removed) return
+      this.pointRecords.splice(this.pointRecords.indexOf(removed), 1)
+      this._archiveFlow(removed)
+    },
+    // 裁剪归档：被裁流水按归属业务日聚合留存（对账/台账判重/余额链/统计的统一留存依据）
+    _archiveFlow(p) {
+      const bizDate = this._flowBizDate(p)
+      let a = this.flowArchive.find((x) => x.bizDate === bizDate)
+      if (!a) {
+        a = {
+          id: genId('fa'), bizDate,
+          count: 0,          // 被裁笔数
+          net: 0,            // 非补偿流水净额（P1 流水实际净额勾稽）
+          compNet: 0,        // 补偿流水净额（P1 已补偿净额勾稽 / 看板累计补偿）
+          rewardNet: 0,      // 奖励类正额（看板「累计发放积分」口径：delta>0 且非返还）
+          manualRewardNet: 0,// 「完成任务：」手动任务奖励净额（P1 应有发生额勾稽，流水即业务凭证）
+          taskRewards: [],   // 被裁的任务结算流水明细 { claimId, taskLabel, reward }（P2 台账判重）
+          taskComps: []      // 被裁的任务补偿流水明细 { claimId, reward }（补偿幂等判重）
+        }
+        this.flowArchive.push(a)
+      }
+      a.count += 1
+      if (p.kind === 'recon-comp' || p.kind === 'task-comp') {
+        a.compNet += p.delta
+        if (p.kind === 'task-comp' && p.refId) a.taskComps.push({ claimId: p.refId, reward: p.delta })
+      } else {
+        a.net += p.delta
+        if (p.kind === 'reward' && p.note.startsWith('完成任务：')) a.manualRewardNet += p.delta
+        if (p.kind === 'reward' && p.note.includes('任务结算')) {
+          a.taskRewards.push({ claimId: p.refId || '', taskLabel: p.note.replace(/^任务结算：/, '').replace(/（.*）/, ''), reward: p.delta })
+        }
+      }
+      if (p.delta > 0 && p.kind !== 'refund') a.rewardNet += p.delta
+      // 余额链锚点：被裁行是现存链之前的重放末行，其余额快照即现存链的重放起算余额
+      if ((p.ts || 0) >= (this.flowAnchor.ts || 0)) this.flowAnchor = { ts: p.ts || 0, balance: p.balance }
     },
 
     // ===== 操作记录（审计日志） =====
@@ -387,7 +430,7 @@ export const usePlatformStore = defineStore('platform', {
         if (this.taskClaims.some((c) => c.taskId === t.id && c.bizDate === date)) return // 已结算，防重
         const crossDay = date !== this.todayDate
         this.points += t.reward
-        this.taskClaims.push({
+        const claim = {
           id: genId('tc'),
           taskId: t.id,
           taskLabel: t.label,
@@ -397,10 +440,12 @@ export const usePlatformStore = defineStore('platform', {
           time: nowTime(),
           ts: Date.now(),
           source: 'auto'
-        })
-        // 流水实际发放日为今日，但 bizDate 标注归属业务日（跨日补计计入原业务日对账，不串当日账）
+        }
+        this.taskClaims.push(claim)
+        // 流水实际发放日为今日，但 bizDate 标注归属业务日（跨日补计计入原业务日对账，不串当日账）；
+        // refId 绑定领奖台账 id——P2 勾稽与补偿判重统一按台账 id 精确匹配，流水裁剪归档后仍可勾稽
         this.addPointRecord(t.reward, `任务结算：${t.label}${crossDay ? `（${date} 业务日补计）` : ''}`, 'reward', {
-          bizDate: date
+          bizDate: date, refId: claim.id, refType: 'task-claim'
         })
         this.addAuditLog('task-settle', null,
           `抽奖任务【${t.label}】达成（${date} 有效参与 ${valid}/${t.goal}），自动发放 ${t.reward} 积分${crossDay ? '（跨日审核补计）' : ''}`)
@@ -828,18 +873,45 @@ export const usePlatformStore = defineStore('platform', {
     // ===== 积分库存对账 =====
     // 对账口径（按业务日 D）：
     //  P1 积分发生额：业务侧（抽奖成本/中奖积分、兑换成本/撤销返还、任务奖励）推导的应有净额
-    //                vs 积分流水实际净额（补偿流水单列），残差即少记/多记
-    //  P2 任务奖励台账：taskClaims 每笔领奖必须有对应流水（跨日补计按发放日勾稽）
-    //  P3 余额链：append-only 流水余额快照逐笔连续，且最新一行余额 == 当前可用积分（安全网）
+    //                vs 积分流水实际净额（补偿流水单列；裁剪归档流水按 bizDate 留存净额合并勾稽），残差即少记/多记
+    //  P2 任务奖励台账：taskClaims 每笔领奖必须有对应流水——统一按台账 id 判重
+    //                （现存流水 refId / task-comp 补偿 / 裁剪归档明细），跨日补计按发放日勾稽
+    //  P3 余额链：以裁剪归档锚点为起算余额，现存流水按 ts 重放快照逐笔连续，且期末余额 == 当前可用积分（安全网）
     //  P4 冻结单据（当前态）：在审单与业务记录状态一致、冻结积分=业务成本、预占库存=账面 frozen
     //  P5 库存账实（当前态）：应有 remain = 初始库存 - 有效消耗 + 库存校正，与实物账逐 SKU 比对
     //
+    // 流水留存：超留存上限的最老流水裁剪后不丢弃，按业务日聚合归档（净额/奖励/任务结算与补偿明细），
+    //          对账勾稽、领奖判重、余额链与看板统计统一从「现存流水 + 归档」推导——裁剪不产生虚假差异，
+    //          已发任务奖励不被误判缺笔而重复补发。
     // 幂等：一业务日一张差异单，签名（各类残差指纹）不变即同一版本；重复执行只追加执行痕迹，不重建、不重复补偿。
     // 跨日：补偿流水带 bizDate 归属原业务日、date 为实际处理日；风控放行/撤销的积分动作按审核日入账。
     // 留痕：原始流水/业务记录/库存行永不改写，所有修正只追加补偿流水与库存校正台账。
 
     _flowBizDate(p) {
       return p.bizDate || p.date
+    },
+    // 某业务日的流水留存视图：现存流水 + 裁剪归档（统一留存口径，裁剪不产生虚假差异）
+    _flowRetentionOf(date) {
+      const arch = this.flowArchive.find((x) => x.bizDate === date) || null
+      return {
+        arch,
+        archNet: arch?.net || 0,
+        archCompNet: arch?.compNet || 0,
+        archManualRewardNet: arch?.manualRewardNet || 0,
+        archTaskRewards: arch?.taskRewards || [],
+        archTaskComps: arch?.taskComps || []
+      }
+    },
+    // 任务领奖是否已有补偿流水（现存 + 已归档）——补偿幂等判重的唯一依据
+    _hasTaskComp(claimId) {
+      return this.pointRecords.some((p) => p.kind === 'task-comp' && p.refId === claimId) ||
+        this.flowArchive.some((a) => a.taskComps.some((t) => t.claimId === claimId))
+    },
+    // 任务领奖是否已有原始发奖流水（现存按台账 id 精确匹配 + 已归档留存）
+    _hasTaskGrantFlow(claim) {
+      if (this.pointRecords.some((p) => p.kind === 'reward' && p.refId && p.refId === claim.id)) return true
+      const arch = this.flowArchive.find((a) => a.bizDate === claim.bizDate)
+      return !!arch && arch.taskRewards.some((t) => t.claimId && t.claimId === claim.id)
     },
     _orderOfRecord(recordId) {
       return this.riskOrders.find((o) => o.recordId === recordId)
@@ -857,11 +929,13 @@ export const usePlatformStore = defineStore('platform', {
       return rec.prizeName && rec.prizeName.includes('积分') ? (parseInt(rec.prizeName) || 0) : 0
     },
 
-    // 计算某业务日的对账差异（纯推导，不落库；补偿流水/校正台账参与勾稽）
+    // 计算某业务日的对账差异（纯推导，不落库；补偿流水/校正台账/裁剪归档均参与勾稽）
     computeReconDiffs(date) {
       const flowsOn = (d) => this.pointRecords.filter((p) => this._flowBizDate(p) === d)
       const isComp = (p) => p.kind === 'recon-comp' || p.kind === 'task-comp'
       const dayFlows = flowsOn(date)
+      // 裁剪归档留存：被裁流水按业务日聚合的净额/明细，与现存流水合并勾稽（统一留存口径）
+      const retention = this._flowRetentionOf(date)
 
       // —— P1 积分发生额 ——
       // 业务侧逐笔推导应有流水（同日同额合成明细，供差异单展示勾稽过程）
@@ -897,13 +971,18 @@ export const usePlatformStore = defineStore('platform', {
           }
         }
       })
-      // 手动任务奖励：以 reward 类"完成任务"流水为业务凭证（补记的 task-comp 补偿流不计入应有发生额）
+      // 手动任务奖励：以 reward 类"完成任务"流水为业务凭证（补记的 task-comp 补偿流不计入应有发生额）；
+      // 已裁剪归档的同类流水净额一并计入（流水即凭证，裁剪归档后口径不变）
       dayFlows.forEach((p) => {
         if (!isComp(p) && p.kind === 'reward' && p.note.startsWith('完成任务：')) {
           expectedNet += p.delta
           expectedDetail.push({ delta: p.delta, label: p.note })
         }
       })
+      if (retention.archManualRewardNet) {
+        expectedNet += retention.archManualRewardNet
+        expectedDetail.push({ delta: retention.archManualRewardNet, label: '完成任务奖励（历史流水已归档留存）' })
+      }
       // 抽奖任务台账：归属业务日为 bizDate（跨日补计计入原业务日，不串审核当日账）；
       // 实际发放日 grantDate 记录在台账与流水上。缺记台账无流水，体现为 P1 残差由 P2 逐笔列出。
       this.taskClaims.forEach((c) => {
@@ -916,23 +995,29 @@ export const usePlatformStore = defineStore('platform', {
         }
       })
 
-      const ledgerNet = dayFlows.filter((p) => !isComp(p)).reduce((s, p) => s + p.delta, 0)
-      const compNet = dayFlows.filter(isComp).reduce((s, p) => s + p.delta, 0)
+      // 流水净额勾稽：现存流水 + 裁剪归档留存（裁剪不丢账，历史业务日不产生虚假残差）
+      const ledgerNet = dayFlows.filter((p) => !isComp(p)).reduce((s, p) => s + p.delta, 0) + retention.archNet
+      const compNet = dayFlows.filter(isComp).reduce((s, p) => s + p.delta, 0) + retention.archCompNet
       const residual = expectedNet - ledgerNet - compNet
 
       // —— P2 任务奖励逐笔勾稽（按归属业务日 bizDate；跨日补计的流水带相同 bizDate） ——
-      // 候选流水：原始"任务结算"reward 流（按任务名匹配）或 task-comp 补偿流（按台账 id 精确匹配）
+      // 判重统一以领奖台账 id 为准：补偿流水（现存/已归档）或原始发奖流水（现存 refId / 已归档明细）；
+      // 兜底兼容早期无 refId 流水，按 任务名+金额+归属业务日 模糊匹配（现存与归档各消耗一次）
       const usedFlowIds = new Set()
+      const usedArchGrants = new Set()
       const taskItems = this.taskClaims
         .filter((c) => c.bizDate === date)
         .map((c) => {
-          const comp = this.pointRecords.find((p) => p.kind === 'task-comp' && p.refId === c.id)
-          if (comp) { usedFlowIds.add(comp.id); return null }
+          if (this._hasTaskComp(c.id)) return null          // 已补偿（含归档留存），幂等
+          if (this._hasTaskGrantFlow(c)) return null        // 原始发奖流水在账（含归档留存）
           const cand = this.pointRecords.find((p) =>
             !usedFlowIds.has(p.id) && !isComp(p) && p.kind === 'reward' &&
             this._flowBizDate(p) === date && p.delta === c.reward &&
             p.note.includes('任务结算') && p.note.includes(c.taskLabel))
           if (cand) { usedFlowIds.add(cand.id); return null }
+          const archIdx = retention.archTaskRewards.findIndex((t, i) =>
+            !usedArchGrants.has(i) && !t.claimId && t.reward === c.reward && t.taskLabel === c.taskLabel)
+          if (archIdx >= 0) { usedArchGrants.add(archIdx); return null }
           return {
             key: `task-${c.id}`, claimId: c.id, label: c.taskLabel, reward: c.reward,
             bizDate: c.bizDate, grantDate: c.grantDate, autoFixable: true
@@ -943,8 +1028,13 @@ export const usePlatformStore = defineStore('platform', {
       const pointsResidual = residual
 
       // —— P3 余额链连续性（当前态安全网） ——
-      const sorted = [...this.pointRecords].sort((a, b) => a.ts - b.ts)
-      let bal = this.points - sorted.reduce((s, p) => s + p.delta, 0)
+      // 以裁剪归档锚点为起算余额，按 ts 正序重放现存流水（同 ts 按记账先后：unshift 数组越靠后记账越早），
+      // 快照须逐笔连续，且重放期末余额 == 当前可用积分；裁剪留存经锚点衔接，不产生虚假断链
+      const sorted = this.pointRecords
+        .map((p, i) => ({ p, i }))
+        .sort((a, b) => ((a.p.ts || 0) - (b.p.ts || 0)) || (b.i - a.i))
+        .map((x) => x.p)
+      let bal = this.flowAnchor.balance || 0
       let brokenRows = 0
       let firstBad = null
       sorted.forEach((p) => {
@@ -954,11 +1044,11 @@ export const usePlatformStore = defineStore('platform', {
           if (!firstBad) firstBad = { id: p.id, expect: bal, actual: p.balance, note: p.note, date: p.date }
         }
       })
-      const head = sorted[sorted.length - 1]
-      const chainItem = (brokenRows > 0 || (head && head.balance !== this.points)) ? {
+      const chainBroken = brokenRows > 0 || bal !== this.points
+      const chainItem = chainBroken ? {
         brokenRows,
-        firstBad,
-        headBalance: head ? head.balance : null,
+        firstBad: firstBad || { id: '', expect: this.points, actual: bal, note: '重放期末余额与当前可用积分不一致', date: '' },
+        headBalance: bal,
         pointsBalance: this.points,
         autoFixable: false   // 不直接改余额/快照；P1/P2 补偿使余额与流水同步后自愈
       } : null
@@ -1146,7 +1236,7 @@ export const usePlatformStore = defineStore('platform', {
 
       // 1) 任务奖励逐笔补记（余额与流水同步追加，保留原始记录）
       live.tasks.forEach((item) => {
-        if (this.pointRecords.some((p) => p.kind === 'task-comp' && p.refId === item.claimId)) return // 幂等
+        if (this._hasTaskComp(item.claimId)) return // 幂等：现存流水与裁剪归档统一判重
         this.points += item.reward
         const cross = item.grantDate !== item.bizDate ? `（归属 ${item.bizDate} 跨日补计）` : ''
         this.addPointRecord(item.reward, `对账补偿：任务奖励补记【${item.label}】${cross}`, 'task-comp', {
@@ -1453,7 +1543,8 @@ export const usePlatformStore = defineStore('platform', {
       })
       this.pointRecords.unshift({
         id: 'seed-pr1', date: d2, time: '08:12:40', ts: todayAt(8, 12) - 2 * DAY,
-        delta: 15, balance: 0, note: '任务结算：今日抽奖3次', kind: 'reward'
+        delta: 15, balance: 0, note: '任务结算：今日抽奖3次', kind: 'reward',
+        refId: 'seed-tc1', refType: 'task-claim'
       })
       // 上一业务日：2 次有效参与 + 1 笔风控冻结（审核中暂缓计入）→ 任务 2/3 未达成；
       // 该跨日审核单放行后按归属业务日 d1 补计进度并结算，撤销则确认不计入
@@ -1512,12 +1603,13 @@ export const usePlatformStore = defineStore('platform', {
       ]
     },
 
-    // 按时间正序重放种子流水，修正每行 balance 快照
+    // 按时间正序重放种子流水，修正每行 balance 快照；链起点写入余额链锚点（裁剪后锚点随归档推进）
     rebalanceSeedPoints() {
       const seeds = this.pointRecords.filter((p) => p.id.startsWith('seed-'))
       if (!seeds.length) return
       const sorted = [...seeds].sort((a, b) => a.ts - b.ts)
       let bal = this.points - sorted.reduce((s, p) => s + p.delta, 0)
+      this.flowAnchor = { ts: 0, balance: bal }
       sorted.forEach((p) => {
         bal += p.delta
         p.balance = bal
