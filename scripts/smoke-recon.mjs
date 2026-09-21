@@ -67,6 +67,35 @@ assert(s.pointRecords.length === flowN, '平账后重复执行不新增流水')
 assert(s.compensateRecon(yd) === null, '已平账单重复补偿零操作')
 assert(s.pointRecords.length === flowN, '无重复补偿流水')
 
+console.log('— 历史流水留存：超过演示条数也不裁剪底账，不制造虚假缺笔 —')
+const historyDates = s.reconDates
+const oldestDate = historyDates[historyDates.length - 1]
+const oldestClaims = s.taskClaims.filter((c) => c.bizDate === oldestDate)
+const flowCountBefore = s.pointRecords.length
+const pointsBeforeRetention = s.points
+for (let i = 0; i < 301; i++) {
+  s.addPointRecord(0, `留存压测流水 ${i + 1}`, 'normal', { ts: Date.now() + i })
+}
+assert(s.pointRecords.length === flowCountBefore + 301,
+  `流水超过 300 条仍完整保留（实际 ${s.pointRecords.length}）`)
+assert(s.points === pointsBeforeRetention, '零发生额压测流水不影响余额')
+assert(!!s.pointRecords.find((p) => p.id === 'seed-pr1'),
+  '最老任务发奖流水未被裁剪')
+assert(oldestClaims.every((c) => s._taskClaimFlow(c)),
+  '每个历史领奖台账仍能精确勾稽到发奖流水')
+s.runRecon(oldestDate, true)
+const oldestBill = s.reconBillOf(oldestDate)
+assert(oldestBill.status === 'balanced' && oldestBill.diffs.openCount === 0,
+  `历史业务日无虚假差异（residual=${oldestBill.diffs.points.residual}，缺笔=${oldestBill.diffs.tasks.length}）`)
+assert(oldestBill.diffs.chain === null, '完整流水重放后余额链连续')
+const compForOldestBefore = s.pointRecords
+  .filter((p) => p.kind === 'task-comp' && oldestClaims.some((c) => c.id === p.refId)).length
+assert(s.compensateRecon(oldestDate) === null, '已发任务奖励不会被对账补偿再次补发')
+const compForOldestAfter = s.pointRecords
+  .filter((p) => p.kind === 'task-comp' && oldestClaims.some((c) => c.id === p.refId)).length
+assert(compForOldestAfter === compForOldestBefore, '未新增任何历史任务补偿流水')
+s.runRecon(oldestDate, true)
+
 console.log('— 今日注入差异：任务漏记 + 库存盘亏 —')
 s.injectTaskFlowGap()
 s.injectStockLoss()

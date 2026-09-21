@@ -38,6 +38,9 @@ assert(s.validDrawCount(today) === 3, `今日有效参与=3（实际 ${s.validDr
 assert(claimsOf(today).length === 1, '达标后自动结算，生成今日领奖记录')
 assert(claimsOf(today)[0].bizDate === today && claimsOf(today)[0].grantDate === today, '领奖记录归属今日')
 assert(s.pointRecords.some((p) => p.note === '任务结算：今日抽奖3次' && p.delta === 15), '积分流水同步 +15（任务结算）')
+assert(claimsOf(today)[0].flowId &&
+  s.pointRecords.some((p) => p.refType === 'task-claim' && p.refId === claimsOf(today)[0].id),
+  '领奖台账与发奖流水通过 claimId 双向勾稽')
 const st = s.drawTaskState('t-draw3')
 assert(st.claimed && st.done, '任务状态：已达标已结算')
 
